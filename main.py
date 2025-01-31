@@ -2,9 +2,9 @@ import time
 import re
 import random
 import requests
+import json
 import os
 from dotenv import load_dotenv
-
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -21,67 +21,68 @@ giga_token = None
 
 @app.get("/")
 async def root():
-    """
-    Простой GET, возвращает признак, что сервер жив.
-    """
+    """Простой GET, проверка работы сервера."""
     return {"message": "Server is up and running"}
 
 
 @app.get("/api/request")
 async def handle_get_request():
-    """
-    Разрешаем GET на /api/request, но говорим, что поддерживается только POST.
-    """
+    """Для GET-запросов сообщаем, что есть только POST."""
     return {"detail": "This route only supports POST requests."}
 
 
 @app.get("/favicon.ico")
 async def favicon():
-    # Чтобы не сыпать логи 404
+    """Чтобы не было лишних ошибок по /favicon.ico."""
     return Response(status_code=204)
 
 
 @app.on_event("startup")
 async def startup_event():
+    """
+    При запуске:
+      1. Настраиваем logger
+      2. Загружаем .env
+      3. Получаем GigaChat-токен (giga_token)
+    """
     global logger, giga_token
     logger = await setup_logger()
+
     load_dotenv()
 
     sber_auth = os.getenv("SBER_AUTH")
     if not sber_auth:
         raise ValueError("Не найдено значение SBER_AUTH в переменных окружения!")
 
-
-    response = get_token(sber_auth)
-    if response.status_code == 200:
-        data = response.json()
+    resp = get_token(sber_auth)
+    if resp.status_code == 200:
+        data = resp.json()
         giga_token = data["access_token"]
         print("GigaChat token получен:", giga_token)
     else:
-        print("Ошибка при получении токена GigaChat:", response.text)
+        print("Ошибка при получении токена GigaChat:", resp.text)
 
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     """
-    Логирование запросов и ответов.
+    Мидлварь: логгирование запросов/ответов.
+    Если хотите убрать полностью, удалите или закомментируйте.
     """
-    print(f"Incoming request: {request.method} {request.url}")
     start_time = time.time()
 
-    body = b""
+    body_bytes = b""
     if request.method in ("POST", "PUT", "PATCH"):
-        body = await request.body()
-        print(f"Request body: {body.decode()}")
+        body_bytes = await request.body()
+
     await logger.info(
         f"Incoming request: {request.method} {request.url}\n"
-        f"Request body: {body.decode()}"
+        f"Request body: {body_bytes.decode()}"
     )
 
     response = await call_next(request)
     process_time = time.time() - start_time
 
-    # Чтобы перехватить тело ответа, нужно «прочитать» response.body_iterator
     response_body = b""
     async for chunk in response.body_iterator:
         response_body += chunk
@@ -101,33 +102,15 @@ async def log_requests(request: Request, call_next):
     )
 
 
-def parse_question(query: str):
-    """
-    Разделяет вопрос и варианты ответов вида:
-    "1. вариант 1", "2. вариант 2" и т.д.
-    Возвращает (текст_вопроса, список_найденных_вариантов).
-    """
-    # Ищем подстроки "\n1. ...", "\n2. ...", и т.д.
-    pattern = r'(\d+)\.\s+'
-    options = re.findall(pattern, query)
-    # options будет списком номеров ("1","2",...) но без текста в данном примере.
-    # Если хотим весь текст, можно доработать.
-
-    # Удалим сами варианты из текста вопроса (грубо говоря)
-    # или возьмём часть до первого варианта.
-    # Тут можно улучшать логику как угодно.
-    return query, options
-
-
 @app.post("/api/request", response_model=PredictionResponse)
 async def predict(body: PredictionRequest):
     """
-    Обрабатывает входящий вопрос:
-      - Пытается выделить варианты ответов (1. 2. 3. ...).
-      - Если варианты найдены, выбирает "правильный" случайно.
-      - Если вариантов нет, возвращает answer=null.
-      - Обращается к GigaChat за рассуждением, кладёт его в reasoning.
-      - Возвращает sources (до 3 ссылок).
+    Основной метод.
+    1) Проверяем, что у нас есть токен GigaChat.
+    2) Формируем system_prompt (где просим отдавать JSON).
+    3) Вызываем get_chat_completion(...)
+    4) Парсим JSON, если модель вернула нестрогий ответ — пытаемся выделить answer.
+    5) Возвращаем PredictionResponse (answer, reasoning, sources).
     """
     try:
         await logger.info(f"Processing prediction request with id: {body.id}")
@@ -135,58 +118,67 @@ async def predict(body: PredictionRequest):
         if not giga_token:
             raise HTTPException(status_code=500, detail="GigaChat токен не инициализирован.")
 
-        # Парсим варианты ответа из вопроса (если это multiple-choice)
-        question_text, options = parse_question(body.query)
-        parsed_answer = None
-        if len(options) > 0:
-            # Выбираем случайный вариант (пример!)
-            parsed_answer = random.randint(1, len(options))
-
-        # Теперь уходим в GigaChat, запрашиваем ответ
-        giga_response = get_chat_completion(giga_token, body.query)
-        if giga_response.status_code != 200:
-            # Если ошибка на стороне GigaChat — логируем и выбрасываем 500
-            msg = f"Ошибка от GigaChat: {giga_response.text}"
-            await logger.error(msg)
-            raise HTTPException(status_code=500, detail=msg)
-
-        # Разбираем JSON
-        # Предположим, что GigaChat возвращает структуру наподобие OpenAI:
-        # {
-        #   "id": "...",
-        #   "choices": [
-        #       {"index":0,"message":{"role":"assistant","content":"..."}}
-        #   ]
-        #   ...
-        # }
-        data = giga_response.json()
-        if not data.get("choices"):
-            # Если почему-то нет поля "choices"
-            raise HTTPException(status_code=500, detail="В ответе GigaChat нет поля 'choices'")
-
-        # Допустим, берём текст из первого choice
-        giga_text = data["choices"][0]["message"]["content"]
-
-        # Пример источников, как в вашем коде
-        sources: List[HttpUrl] = [
+        final_sources = [
             "https://itmo.ru/ru/",
             "https://abit.itmo.ru/"
         ]
 
-        response = PredictionResponse(
+        system_prompt = (
+            "Ты — официальный информационный агент Университета ИТМО.\n"
+            "Если вопрос содержит варианты (1..N), выбери нужный вариант.\n"
+            "Если нет вариантов — answer=null.\n"
+            "Ответ ДОЛЖЕН быть в формате JSON, без лишних слов:\n"
+            "{\n"
+            '  "answer": 2 или null,\n'
+            '  "reasoning": "Пояснение..."\n'
+            "}\n\n"
+        )
+
+        giga_response = get_chat_completion(
+            auth_token=giga_token,
+            system_prompt=system_prompt,
+            user_prompt=body.query
+        )
+        if giga_response.status_code != 200:
+            msg = f"Ошибка от GigaChat: {giga_response.text}"
+            await logger.error(msg)
+            raise HTTPException(status_code=500, detail=msg)
+
+        data = giga_response.json()
+        if not data.get("choices"):
+            raise HTTPException(status_code=500, detail="В ответе GigaChat нет поля 'choices'")
+
+        model_text = data["choices"][0]["message"]["content"].strip()
+
+        answer_val = None
+        reasoning_val = ""
+
+        try:
+            parsed = json.loads(model_text)
+            answer_val = parsed.get("answer", None)
+            reasoning_val = parsed.get("reasoning", "")
+        except json.JSONDecodeError:
+            match = re.search(r"\b(\d{1,2})\b", model_text)
+            if match:
+                answer_val = int(match.group(1))
+            else:
+                answer_val = None
+            reasoning_val = model_text
+
+        if isinstance(answer_val, str) and answer_val.isdigit():
+            answer_val = int(answer_val)
+
+        response_obj = PredictionResponse(
             id=body.id,
-            answer=parsed_answer,     # Если multiple choice
-            reasoning="Модель-GigaChat: " + giga_text,      # Сюда пишем «рассуждение» от GigaChat
-            sources=sources
+            answer=answer_val,
+            reasoning=reasoning_val,
+            sources=final_sources
         )
 
         await logger.info(f"Successfully processed request {body.id}")
-        return response
+        return response_obj
 
-    except ValueError as e:
-        error_msg = str(e)
-        await logger.error(f"Validation error for request {body.id}: {error_msg}")
-        raise HTTPException(status_code=400, detail=error_msg)
     except Exception as e:
-        await logger.error(f"Internal error processing request {body.id}: {str(e)}")
+        err_str = str(e)
+        await logger.error(f"Internal error processing request {body.id}: {err_str}")
         raise HTTPException(status_code=500, detail="Internal server error")
