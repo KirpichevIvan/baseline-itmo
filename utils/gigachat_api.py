@@ -12,7 +12,7 @@ def get_token(auth_token, scope='GIGACHAT_API_PERS'):
     }
     payload = { 'scope': scope }
 
-    response = requests.post(url, headers=headers, data=payload, verify=False)
+    response = requests.post(url, headers=headers, data=payload)
     return response
 
 def get_chat_completion(auth_token, user_message):
@@ -35,5 +35,5 @@ def get_chat_completion(auth_token, user_message):
         'Accept': 'application/json',
         'Authorization': f'Bearer {auth_token}'
     }
-    response = requests.post(url, json=payload, headers=headers, verify=False)
+    response = requests.post(url, json=payload, headers=headers)
     return response

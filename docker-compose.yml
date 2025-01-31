@@ -2,7 +2,10 @@ version: "3.8"
 
 services:
   fastapi-service:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: test-baseline
     container_name: fastapi-baseline
     ports:
       - "8080:8080"
