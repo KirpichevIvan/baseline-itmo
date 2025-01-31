@@ -3,6 +3,8 @@ import re
 import random
 import requests
 import os
+from dotenv import load_dotenv
+
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -43,13 +45,12 @@ async def favicon():
 async def startup_event():
     global logger, giga_token
     logger = await setup_logger()
+    load_dotenv()
 
-    # base64 авторизация для Сбера (пример)
-    sber_auth = "M2RmMzI0ZjEtMzJjMi00MDcxLThhY2ItM2RiOWFjNmQxOTEyOmJlMzM3ZDEyLTA0N2ItNDU1Yi1iZDJlLTE5YTgxYzA3NTg0Yw=="
-
+    sber_auth = os.getenv("SBER_AUTH")
     if not sber_auth:
-        print("Не найдено SBER_AUTH в переменных окружения!")
-        return
+        raise ValueError("Не найдено значение SBER_AUTH в переменных окружения!")
+
 
     response = get_token(sber_auth)
     if response.status_code == 200:
